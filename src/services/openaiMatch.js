@@ -536,6 +536,7 @@ export async function matchResumeToJob({ resume_text, job_text, job_url = "", jo
   const skillsScore = computeSkillsEligibility(requirements);
   const eligibilityPct = skillsScore.eligibility_pct;
   const rec = recommendationFromScore(matchScore);
+  const overallMatchScore = computeMatchScore(requirements);
 
   // Minimum report threshold:
   const gaps = requirements.filter((r) => {
@@ -580,7 +581,7 @@ export async function matchResumeToJob({ resume_text, job_text, job_url = "", jo
   const missing_preferred_skills = missing_preferred_skills_top5;
 
   return {
-    p: clamp(Math.round(eligibilityPct), 0, 100),
+    p: clamp(Math.round(eligibility_pct), 0, 100),
     report,
     json: {
       status: "ELIGIBLE",
@@ -588,6 +589,7 @@ export async function matchResumeToJob({ resume_text, job_text, job_url = "", jo
       blocker_text: null,
       eligible_for_opt: true,
       match_score: matchScore,     // old overall score (same rahe)
+      overall_match_score: overallMatchScore, // old average (keep for reference)
       skills_score: skillsScore,   // NEW: eligibility breakdown
       recommendation: rec,
 
