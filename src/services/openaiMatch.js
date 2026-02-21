@@ -30,6 +30,86 @@ function computeMatchScore(requirements) {
   const sum = items.reduce((acc, r) => acc + (TIER_POINTS[r?.match_level] ?? 0), 0);
   return Math.round((sum / items.length) * 1000) / 10; // 1 decimal
 }
+// ---- SKILLS-ONLY ELIGIBILITY (Matched/Unmatched + Gap penalty + Improvement) ----
+function isSkillsOrToolsCategory(category) {
+  const c = String(category || "").toLowerCase();
+  return c.includes("tools") || c.includes("skills");
+}
+
+const SKILL_POINTS = { Exact: 1.0, Close: 0.85, Partial: 0.5, Missing: 0.0 };
+const PRIORITY_WEIGHT = { must_have: 1.6, preferred: 1.2, unspecified: 1.0 };
+
+function computeSkillsEligibility(requirements = []) {
+  const items = (Array.isArray(requirements) ? requirements : []).filter((r) =>
+    isSkillsOrToolsCategory(r?.category)
+  );
+
+  const total = items.length;
+  if (!total) {
+    return {
+      skills_total: 0,
+      skills_matched: 0,
+      skills_partial: 0,
+      skills_missing: 0,
+      missing_must_have: 0,
+      missing_preferred: 0,
+      skills_coverage_pct: 0,
+      penalty_points: 0,
+      eligibility_pct: 0,
+      improvement_potential_pct: 0,
+    };
+  }
+
+  let weightedSum = 0;
+  let weightedTotal = 0;
+
+  let matched = 0, partial = 0, missing = 0;
+  let missMust = 0, missPref = 0, missUnspec = 0;
+
+  for (const r of items) {
+    const level = r?.match_level;
+    const priority = r?.priority || "unspecified";
+
+    const w = PRIORITY_WEIGHT[priority] ?? 1.0;
+    const p = SKILL_POINTS[level] ?? 0;
+
+    weightedSum += p * w;
+    weightedTotal += 1 * w;
+
+    if (level === "Missing") {
+      missing++;
+      if (priority === "must_have") missMust++;
+      else if (priority === "preferred") missPref++;
+      else missUnspec++;
+    } else {
+      matched++;
+      if (level === "Partial") partial++;
+    }
+  }
+
+  const skillsCoveragePct = Math.round((weightedSum / weightedTotal) * 100);
+
+  // Gap penalty (must_have missing sabse zyada hurt kare)
+  const penalty = (missMust * 12) + (missPref * 6) + (missUnspec * 2);
+
+  const eligibilityPct = clamp(skillsCoveragePct - penalty, 0, 100);
+
+  // Improvement potential = partial + preferred/unspecified missing (easy wins)
+  const improvementPotentialPct = Math.round(((partial + missPref + missUnspec) / total) * 100);
+
+  return {
+    skills_total: total,
+    skills_matched: matched,
+    skills_partial: partial,
+    skills_missing: missing,
+    missing_must_have: missMust,
+    missing_preferred: missPref,
+    skills_coverage_pct: skillsCoveragePct,
+    penalty_points: penalty,
+    eligibility_pct: eligibilityPct,
+    improvement_potential_pct: improvementPotentialPct,
+  };
+}
 
 function recommendationFromScore(score) {
   if (score >= 80) return "APPLY";
@@ -363,7 +443,7 @@ export async function matchResumeToJob({ resume_text, job_text, job_url = "", jo
                   why_it_matters: { type: "string" },
                   quick_fix: { type: "string" }
                 },
-                required: ["gap","why_it_matters","quick_fix"],
+                required: ["gap", "why_it_matters", "quick_fix"],
                 additionalProperties: false
               }
             },
@@ -453,6 +533,8 @@ export async function matchResumeToJob({ resume_text, job_text, job_url = "", jo
   });
 
   const matchScore = computeMatchScore(requirements);
+  const skillsScore = computeSkillsEligibility(requirements);
+  const eligibilityPct = skillsScore.eligibility_pct;
   const rec = recommendationFromScore(matchScore);
 
   // Minimum report threshold:
@@ -498,14 +580,15 @@ export async function matchResumeToJob({ resume_text, job_text, job_url = "", jo
   const missing_preferred_skills = missing_preferred_skills_top5;
 
   return {
-    p: clamp(Math.round(matchScore), 0, 100),
+    p: clamp(Math.round(eligibilityPct), 0, 100),
     report,
     json: {
       status: "ELIGIBLE",
       blocker_type: null,
       blocker_text: null,
       eligible_for_opt: true,
-      match_score: matchScore,
+      match_score: matchScore,     // old overall score (same rahe)
+      skills_score: skillsScore,   // NEW: eligibility breakdown
       recommendation: rec,
 
       // ✅ NEW (top5)
