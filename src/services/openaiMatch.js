@@ -55,7 +55,7 @@ function computeSkillsEligibility(requirements = []) {
       missing_preferred: 0,
       skills_coverage_pct: 0,
       penalty_points: 0,
-      eligibilityPct: 0,
+      eligibility_pct: 0,
       improvement_potential_pct: 0,
     };
   }
@@ -86,12 +86,13 @@ function computeSkillsEligibility(requirements = []) {
       if (level === "Partial") partial++;
     }
   }
-  const skillsCoveragePct = Math.round((weightedSum / weightedTotal) * 100);
-  
+
+  const skillsCoveragePct = weightedTotal ? Math.round((weightedSum / weightedTotal) * 100) : 0;
+
   // Gap penalty (must_have missing sabse zyada hurt kare)
   const penalty = (missMust * 12) + (missPref * 6) + (missUnspec * 2);
-  
-  // const eligibilityPct = clamp(skillsCoveragePct - penalty, 0, 100);
+
+  const eligibilityPct = clamp(skillsCoveragePct - penalty, 0, 100);
 
   // Improvement potential = partial + preferred/unspecified missing (easy wins)
   const improvementPotentialPct = Math.round(((partial + missPref + missUnspec) / total) * 100);
@@ -105,7 +106,7 @@ function computeSkillsEligibility(requirements = []) {
     missing_preferred: missPref,
     skills_coverage_pct: skillsCoveragePct,
     penalty_points: penalty,
-    eligibilityPct: eligibilityPct,
+    eligibility_pct: eligibilityPct,
     improvement_potential_pct: improvementPotentialPct,
   };
 }
@@ -533,7 +534,7 @@ export async function matchResumeToJob({ resume_text, job_text, job_url = "", jo
 
   const matchScore = computeMatchScore(requirements);
   const skillsScore = computeSkillsEligibility(requirements);
-  const eligibilityPct = skillsScore.eligibilityPct;
+  const eligibilityPct = skillsScore.eligibility_pct;
   const rec = recommendationFromScore(matchScore);
   const overallMatchScore = computeMatchScore(requirements);
 
