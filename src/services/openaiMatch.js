@@ -43,6 +43,7 @@ function computeSkillsEligibility(requirements = []) {
   const items = (Array.isArray(requirements) ? requirements : []).filter((r) =>
     isSkillsOrToolsCategory(r?.category)
   );
+  const eligibilityPct = clamp(skillsCoveragePct - penalty, 0, 100);
 
   const total = items.length;
   if (!total) {
@@ -55,7 +56,7 @@ function computeSkillsEligibility(requirements = []) {
       missing_preferred: 0,
       skills_coverage_pct: 0,
       penalty_points: 0,
-      eligibility_pct: 0,
+      eligibilityPct: 0,
       improvement_potential_pct: 0,
     };
   }
@@ -92,8 +93,6 @@ function computeSkillsEligibility(requirements = []) {
   // Gap penalty (must_have missing sabse zyada hurt kare)
   const penalty = (missMust * 12) + (missPref * 6) + (missUnspec * 2);
 
-  const eligibilityPct = clamp(skillsCoveragePct - penalty, 0, 100);
-
   // Improvement potential = partial + preferred/unspecified missing (easy wins)
   const improvementPotentialPct = Math.round(((partial + missPref + missUnspec) / total) * 100);
 
@@ -106,7 +105,7 @@ function computeSkillsEligibility(requirements = []) {
     missing_preferred: missPref,
     skills_coverage_pct: skillsCoveragePct,
     penalty_points: penalty,
-    eligibility_pct: eligibilityPct,
+    eligibilityPct: eligibilityPct,
     improvement_potential_pct: improvementPotentialPct,
   };
 }
@@ -534,7 +533,7 @@ export async function matchResumeToJob({ resume_text, job_text, job_url = "", jo
 
   const matchScore = computeMatchScore(requirements);
   const skillsScore = computeSkillsEligibility(requirements);
-  const eligibilityPct = skillsScore.eligibility_pct;
+  const eligibilityPct = skillsScore.eligibilityPct;
   const rec = recommendationFromScore(matchScore);
   const overallMatchScore = computeMatchScore(requirements);
 
@@ -581,7 +580,7 @@ export async function matchResumeToJob({ resume_text, job_text, job_url = "", jo
   const missing_preferred_skills = missing_preferred_skills_top5;
 
   return {
-    p: clamp(Math.round(eligibility_pct), 0, 100),
+    p: clamp(Math.round(eligibilityPct), 0, 100),
     report,
     json: {
       status: "ELIGIBLE",
