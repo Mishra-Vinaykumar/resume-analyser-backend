@@ -43,7 +43,6 @@ function computeSkillsEligibility(requirements = []) {
   const items = (Array.isArray(requirements) ? requirements : []).filter((r) =>
     isSkillsOrToolsCategory(r?.category)
   );
-  const eligibilityPct = clamp(skillsCoveragePct - penalty, 0, 100);
 
   const total = items.length;
   if (!total) {
@@ -87,11 +86,12 @@ function computeSkillsEligibility(requirements = []) {
       if (level === "Partial") partial++;
     }
   }
-
   const skillsCoveragePct = Math.round((weightedSum / weightedTotal) * 100);
-
+  
   // Gap penalty (must_have missing sabse zyada hurt kare)
   const penalty = (missMust * 12) + (missPref * 6) + (missUnspec * 2);
+  
+  // const eligibilityPct = clamp(skillsCoveragePct - penalty, 0, 100);
 
   // Improvement potential = partial + preferred/unspecified missing (easy wins)
   const improvementPotentialPct = Math.round(((partial + missPref + missUnspec) / total) * 100);
