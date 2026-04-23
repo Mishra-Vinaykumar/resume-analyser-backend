@@ -1,43 +1,90 @@
 // utils/resumeSections.js
-const HEADINGS = [
-  { key: "summary", re: /^\s*(professional\s+summary|summary)\s*[:\-]?\s*(.*)$/i },
-  { key: "skills", re: /^\s*(technical\s+skills|skills)\s*[:\-]?\s*(.*)$/i },
-  { key: "experience", re: /^\s*(work\s+experience|professional\s+experience|experience)\s*[:\-]?\s*(.*)$/i },
+
+const ALLOWED_SECTION_HEADERS = [
+  "summary",
+  "professional summary",
+  "experience",
+  "work experience",
+  "professional experience",
+  "employment",
+  "skills",
+  "technical skills",
+  "projects",
+  "personal projects",
+  "academic projects",
+  "certifications",
+  "education",
 ];
+
+const SECTION_KEY_MAP = {
+  summary: "summary",
+  "professional summary": "summary",
+
+  skills: "skills",
+  "technical skills": "skills",
+
+  experience: "experience",
+  "work experience": "experience",
+  "professional experience": "experience",
+  employment: "experience",
+
+  projects: "projects",
+  "personal projects": "projects",
+  "academic projects": "projects",
+
+  certifications: "certifications",
+  education: "education",
+};
+
+function escapeRegex(str) {
+  return str.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+const HEADING_REGEX = new RegExp(
+  `^\\s*(${ALLOWED_SECTION_HEADERS.map(escapeRegex).join("|")})\\s*[:\\-]?\\s*(.*)$`,
+  "i"
+);
 
 export function extractAllowedResumeText(resumeText) {
   const lines = String(resumeText || "").split(/\r?\n/);
 
-  /** @type {{summary: string[], skills: string[], experience: string[]}} */
-  const buckets = { summary: [], skills: [], experience: [] };
+  /** @type {{summary: string[], skills: string[], experience: string[], projects: string[], certifications: string[], education: string[]}} */
+  const buckets = {
+    summary: [],
+    skills: [],
+    experience: [],
+    projects: [],
+    certifications: [],
+    education: [],
+  };
 
-  /** @type {"summary"|"skills"|"experience"|null} */
+  /** @type {"summary"|"skills"|"experience"|"projects"|"certifications"|"education"|null} */
   let current = null;
 
   for (const rawLine of lines) {
     const line = rawLine || "";
 
-    let switched = false;
-    for (const h of HEADINGS) {
-      const m = line.match(h.re);
-      if (m) {
-        current = h.key;
-        const sameLineContent = (m[2] || "").trim();
-        if (sameLineContent) buckets[current].push(sameLineContent);
-        switched = true;
-        break;
-      }
-    }
-    if (switched) continue;
+    const match = line.match(HEADING_REGEX);
+    if (match) {
+      const rawHeader = (match[1] || "").trim().toLowerCase();
+      const sameLineContent = (match[2] || "").trim();
 
-    if (current) buckets[current].push(line);
+      current = SECTION_KEY_MAP[rawHeader] || null;
+
+      if (current && sameLineContent) {
+        buckets[current].push(sameLineContent);
+      }
+      continue;
+    }
+
+    if (current) {
+      buckets[current].push(line);
+    }
   }
 
-  const hasAny =
-    buckets.summary.join("").trim() || buckets.skills.join("").trim() || buckets.experience.join("").trim();
+  const hasAny = Object.values(buckets).some((arr) => arr.join("").trim());
 
-  // If headings weren’t detectable, safest fallback is: pass the whole resume,
-  // but label it so your prompt still enforces “use only provided text”.
+  // fallback if no headings detected
   if (!hasAny) {
     return {
       allowedText: String(resumeText || ""),
@@ -46,13 +93,22 @@ export function extractAllowedResumeText(resumeText) {
   }
 
   const detectedSections = Object.entries(buckets)
-    .filter(([, v]) => v.join("").trim())
-    .map(([k]) => k);
+    .filter(([, value]) => value.join("").trim())
+    .map(([key]) => key);
 
-  const allowedText =
-    `SUMMARY:\n${buckets.summary.join("\n").trim()}\n\n` +
-    `SKILLS:\n${buckets.skills.join("\n").trim()}\n\n` +
-    `EXPERIENCE:\n${buckets.experience.join("\n").trim()}\n`;
+  const allowedText = [
+    `SUMMARY:\n${buckets.summary.join("\n").trim()}`,
+    `SKILLS:\n${buckets.skills.join("\n").trim()}`,
+    `EXPERIENCE:\n${buckets.experience.join("\n").trim()}`,
+    `PROJECTS:\n${buckets.projects.join("\n").trim()}`,
+    `CERTIFICATIONS:\n${buckets.certifications.join("\n").trim()}`,
+    `EDUCATION:\n${buckets.education.join("\n").trim()}`,
+  ]
+    .filter((section) => !section.endsWith(":\n"))
+    .join("\n\n");
 
-  return { allowedText, detectedSections };
+  return {
+    allowedText,
+    detectedSections,
+  };
 }
