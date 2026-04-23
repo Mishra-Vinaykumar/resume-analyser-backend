@@ -1,19 +1,71 @@
 // utils/optBlockers.js
+
 const BLOCKER_RULES = [
   // Security clearance
-  { type: "security_clearance", patterns: ["security clearance", "secret clearance", "top secret", "ts/sci", "public trust", "ssbi", "clearable", "able to obtain clearance", "dod clearance", "government clearance"] },
+  {
+    type: "security_clearance",
+    patterns: [
+      "security clearance",
+      "secret clearance",
+      "top secret",
+      "ts/sci",
+      "public trust",
+      "ssbi",
+      "clearable",
+      "able to obtain clearance",
+      "dod clearance",
+      "government clearance",
+    ],
+  },
 
   // Citizenship
-  { type: "citizenship_required", patterns: ["u.s. citizen", "us citizen", "united states citizen", "citizenship required", "must be a citizen", "only us citizens", "american citizen"] },
+  {
+    type: "citizenship_required",
+    patterns: [
+      "u.s. citizen",
+      "us citizen",
+      "united states citizen",
+      "citizenship required",
+      "must be a citizen",
+      "only us citizens",
+      "american citizen",
+    ],
+  },
 
   // Permanent residency
-  { type: "permanent_residency", patterns: ["green card required", "permanent resident", "lawful permanent resident", "lpr", "gc holder"] },
+  {
+    type: "permanent_residency",
+    patterns: [
+      "green card required",
+      "green card holders only",
+      "permanent resident",
+      "permanent resident only",
+      "lawful permanent resident",
+      "lpr",
+      "gc holder",
+    ],
+  },
 
   // Government/federal restrictions
-  { type: "government_restriction", patterns: ["federal employee", "government position", "federal agency", "dod contractor", "defense contractor", "federal contract", "government contractor"] },
+  {
+    type: "government_restriction",
+    patterns: [
+      "federal employee",
+      "government position",
+      "federal agency",
+      "dod contractor",
+      "defense contractor",
+      "federal contract",
+      "government contractor",
+      "government only",
+    ],
+  },
 
   // Export control
-  { type: "export_control", patterns: ["itar", "export control"] },
+  {
+    type: "export_control",
+    patterns: ["itar", "export control"],
+  },
 ];
 
 function findLineContaining(text, idx) {
@@ -23,7 +75,7 @@ function findLineContaining(text, idx) {
   return text.slice(start, end).trim();
 }
 
-export function detectOptBlocker(jobText) {
+export function detectHardBlockers(jobText = "") {
   const original = String(jobText || "");
   const lower = original.toLowerCase();
 
@@ -32,12 +84,31 @@ export function detectOptBlocker(jobText) {
       const i = lower.indexOf(phrase.toLowerCase());
       if (i !== -1) {
         const blockerLine = findLineContaining(original, i);
+
         return {
+          blocked: true,
           blocker_type: rule.type,
           blocker_text: blockerLine || phrase,
         };
       }
     }
   }
-  return null;
+
+  return {
+    blocked: false,
+    blocker_type: null,
+    blocker_text: null,
+  };
+}
+
+// Optional backward-compatible wrapper
+export function detectOptBlocker(jobText = "") {
+  const result = detectHardBlockers(jobText);
+
+  if (!result.blocked) return null;
+
+  return {
+    blocker_type: result.blocker_type,
+    blocker_text: result.blocker_text,
+  };
 }
