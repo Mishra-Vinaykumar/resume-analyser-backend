@@ -1,11 +1,13 @@
 import OpenAI from "openai";
 import { extractAllowedResumeText } from "../utils/resumeSections.js";
 import { extractStarredItems } from "../utils/jdPriority.js";
-import { detectOptBlocker } from "../utils/optBlockers.js"; // ✅ keep Step 0 blockers (if you already do it in route, you can remove)
+import { detectHardBlockers } from "../utils/optBlockers.js";
 
 const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
 const TIER_POINTS = { Exact: 1.0, Close: 0.8, Partial: 0.5, Missing: 0.0 };
+const SKILL_POINTS = { Exact: 1.0, Close: 0.85, Partial: 0.5, Missing: 0.0 };
+const PRIORITY_WEIGHT = { must_have: 1.6, preferred: 1.2, unspecified: 1.0 };
 
 function clamp(n, min, max) {
   return Math.max(min, Math.min(max, n));
@@ -13,13 +15,15 @@ function clamp(n, min, max) {
 
 function uniq(arr) {
   const out = [];
-  const s = new Set();
-  for (const x of arr || []) {
-    const k = String(x || "").trim();
-    if (!k || s.has(k)) continue;
-    s.add(k);
-    out.push(k);
+  const seen = new Set();
+
+  for (const item of arr || []) {
+    const val = String(item || "").trim();
+    if (!val || seen.has(val)) continue;
+    seen.add(val);
+    out.push(val);
   }
+
   return out;
 }
 
@@ -28,16 +32,13 @@ function computeMatchScore(requirements) {
   if (!items.length) return 0;
 
   const sum = items.reduce((acc, r) => acc + (TIER_POINTS[r?.match_level] ?? 0), 0);
-  return Math.round((sum / items.length) * 1000) / 10; // 1 decimal
+  return Math.round((sum / items.length) * 1000) / 10;
 }
-// ---- SKILLS-ONLY ELIGIBILITY (Matched/Unmatched + Gap penalty + Improvement) ----
+
 function isSkillsOrToolsCategory(category) {
   const c = String(category || "").toLowerCase();
   return c.includes("tools") || c.includes("skills");
 }
-
-const SKILL_POINTS = { Exact: 1.0, Close: 0.85, Partial: 0.5, Missing: 0.0 };
-const PRIORITY_WEIGHT = { must_have: 1.6, preferred: 1.2, unspecified: 1.0 };
 
 function computeSkillsEligibility(requirements = []) {
   const items = (Array.isArray(requirements) ? requirements : []).filter((r) =>
@@ -63,18 +64,22 @@ function computeSkillsEligibility(requirements = []) {
   let weightedSum = 0;
   let weightedTotal = 0;
 
-  let matched = 0, partial = 0, missing = 0;
-  let missMust = 0, missPref = 0, missUnspec = 0;
+  let matched = 0;
+  let partial = 0;
+  let missing = 0;
+  let missMust = 0;
+  let missPref = 0;
+  let missUnspec = 0;
 
   for (const r of items) {
     const level = r?.match_level;
     const priority = r?.priority || "unspecified";
 
-    const w = PRIORITY_WEIGHT[priority] ?? 1.0;
-    const p = SKILL_POINTS[level] ?? 0;
+    const weight = PRIORITY_WEIGHT[priority] ?? 1.0;
+    const points = SKILL_POINTS[level] ?? 0;
 
-    weightedSum += p * w;
-    weightedTotal += 1 * w;
+    weightedSum += points * weight;
+    weightedTotal += weight;
 
     if (level === "Missing") {
       missing++;
@@ -87,15 +92,15 @@ function computeSkillsEligibility(requirements = []) {
     }
   }
 
-  const skillsCoveragePct = weightedTotal ? Math.round((weightedSum / weightedTotal) * 100) : 0;
+  const skillsCoveragePct = weightedTotal
+    ? Math.round((weightedSum / weightedTotal) * 100)
+    : 0;
 
-  // Gap penalty (must_have missing sabse zyada hurt kare)
-  const penalty = (missMust * 12) + (missPref * 6) + (missUnspec * 2);
-
+  const penalty = missMust * 12 + missPref * 6 + missUnspec * 2;
   const eligibilityPct = clamp(skillsCoveragePct - penalty, 0, 100);
-
-  // Improvement potential = partial + preferred/unspecified missing (easy wins)
-  const improvementPotentialPct = Math.round(((partial + missPref + missUnspec) / total) * 100);
+  const improvementPotentialPct = Math.round(
+    ((partial + missPref + missUnspec) / total) * 100
+  );
 
   return {
     skills_total: total,
@@ -111,326 +116,338 @@ function computeSkillsEligibility(requirements = []) {
   };
 }
 
-function recommendationFromScore(score) {
-  if (score >= 80) return "APPLY";
-  if (score >= 65) return "APPLY_WITH_ADJUSTMENTS";
-  return "BORDERLINE";
+function computeVerdict({
+  blocked = false,
+  rawScore = 0,
+  missingMustHaveCount = 0,
+  missingPreferredCount = 0,
+  experienceMatch = null,
+  locationMatch = null,
+}) {
+  if (blocked) {
+    return {
+      fit_score: 0,
+      verdict: "BLOCKED",
+      time_worthiness: "LOW",
+      tailoring_effort: "HIGH",
+    };
+  }
+
+  let score = Number(rawScore) || 0;
+
+  score -= missingMustHaveCount * 10;
+  score -= missingPreferredCount * 4;
+
+  if (experienceMatch === true) score += 6;
+  if (experienceMatch === false) score -= 8;
+
+  if (locationMatch === true) score += 3;
+  if (locationMatch === false) score -= 4;
+
+  score = clamp(Math.round(score), 0, 100);
+
+  let verdict = "SKIP";
+  if (score >= 85) verdict = "APPLY_NOW";
+  else if (score >= 70) verdict = "APPLY_WITH_TAILORING";
+  else if (score >= 55) verdict = "STRETCH_APPLY";
+  else verdict = "SKIP";
+
+  let timeWorthiness = "LOW";
+  if (verdict === "APPLY_NOW") timeWorthiness = "HIGH";
+  else if (verdict === "APPLY_WITH_TAILORING") timeWorthiness = "MEDIUM";
+  else if (verdict === "STRETCH_APPLY") timeWorthiness = "MEDIUM";
+
+  let tailoringEffort = "HIGH";
+  if (missingMustHaveCount === 0) tailoringEffort = "LOW";
+  else if (missingMustHaveCount <= 2) tailoringEffort = "MEDIUM";
+
+  return {
+    fit_score: score,
+    verdict,
+    time_worthiness: timeWorthiness,
+    tailoring_effort: tailoringEffort,
+  };
+}
+
+function buildDecisionReasons({
+  blockerText = null,
+  matchedSkills = [],
+  missingMustHaveSkills = [],
+  missingPreferredSkills = [],
+  experienceMatch = null,
+  locationMatch = null,
+}) {
+  const reasons = [];
+
+  if (blockerText) {
+    reasons.push("This role has a hard requirement you likely cannot satisfy.");
+  }
+
+  if (matchedSkills.length) {
+    reasons.push(`Strong overlap in core skills: ${matchedSkills.slice(0, 3).join(", ")}.`);
+  }
+
+  if (missingMustHaveSkills.length) {
+    reasons.push(
+      `Missing must-have requirements: ${missingMustHaveSkills.slice(0, 3).join(", ")}.`
+    );
+  } else if (missingPreferredSkills.length) {
+    reasons.push(
+      `Mostly preferred gaps remain: ${missingPreferredSkills.slice(0, 3).join(", ")}.`
+    );
+  }
+
+  if (experienceMatch === false) {
+    reasons.push("Experience level appears below the role requirement.");
+  } else if (experienceMatch === true) {
+    reasons.push("Experience level appears aligned with the role.");
+  }
+
+  if (locationMatch === false) {
+    reasons.push("Location or work-mode may not be compatible.");
+  } else if (locationMatch === true) {
+    reasons.push("Location or work-mode appears compatible.");
+  }
+
+  return reasons.slice(0, 3);
 }
 
 function wrapReport(body) {
   return `REPORT (conversational analysis):\n"""\n${body}\n"""`;
 }
 
-function isHighImpactCategory(category) {
-  const c = String(category || "").toLowerCase();
-  return (
-    c.includes("tools") ||
-    c.includes("domain") ||
-    c.includes("industry") ||
-    c.includes("regulatory") ||
-    c.includes("compliance") ||
-    c.includes("outcomes") ||
-    c.includes("impact")
-  );
+function buildBlockerReport({ blocker, job_title }) {
+  const position = job_title || "Not provided";
+
+  const body =
+    `🚫 APPLICATION BLOCKED
+
+Position: ${position}
+
+BLOCKER IDENTIFIED:
+- ${blocker.blocker_text}
+
+WHY THIS ROLE IS NOT WORTH APPLYING TO:
+This job posting contains a hard restriction such as citizenship, clearance, permanent residency, or export-control language.
+
+RECOMMENDATION:
+Skip this role and spend your time on jobs without this blocker.`;
+
+  return body;
 }
 
-function categoryRank(category) {
-  const c = String(category || "").toLowerCase();
-  if (c.includes("tools")) return 1;
-  if (c.includes("domain") || c.includes("industry")) return 2;
-  if (c.includes("regulatory") || c.includes("compliance")) return 3;
-  if (c.includes("outcomes") || c.includes("impact")) return 4;
-  return 5;
-}
-
-function matchLevelRank(level) {
-  if (level === "Missing") return 1;
-  if (level === "Partial") return 2;
-  if (level === "Close") return 3;
-  return 4; // Exact
-}
-
-function isKeyCloseOrPartial(r) {
-  const c = String(r.category || "").toLowerCase();
-  const isTools = c.includes("tools");
-  const isReg = c.includes("regulatory") || c.includes("compliance");
-  const isDomain = c.includes("domain") || c.includes("industry");
-  return (isTools || isReg || isDomain) && (r.match_level === "Close" || r.match_level === "Partial");
-}
-
-function buildReport({ matchScore, gaps, closeMatches, summaryText }) {
+function buildReport({ fitScore, verdict, matchedSkills, missingMustHave, missingPreferred, summaryText }) {
   const lines = [];
-  lines.push("✅ OPT/STEM OPT ELIGIBLE - No critical blockers detected");
-  lines.push("");
-  lines.push(`Match Score: ${matchScore.toFixed(1)}%`);
-  lines.push("");
-  lines.push("HIGH-IMPACT GAPS:");
+
+  lines.push(`Verdict: ${verdict}`);
+  lines.push(`Fit Score: ${fitScore}%`);
   lines.push("");
 
-  if (!gaps.length) {
-    lines.push("(No high-impact gaps detected based on current filtering.)");
-    lines.push("");
+  lines.push("Top matched skills:");
+  if (matchedSkills.length) {
+    for (const item of matchedSkills.slice(0, 5)) lines.push(`- ${item}`);
   } else {
-    const sorted = [...gaps].sort((a, b) => {
-      const cr = categoryRank(a.category) - categoryRank(b.category);
-      if (cr !== 0) return cr;
-      const mr = matchLevelRank(a.match_level) - matchLevelRank(b.match_level);
-      if (mr !== 0) return mr;
-      return String(a.requirement).localeCompare(String(b.requirement));
-    });
-
-    const byCat = new Map();
-    for (const g of sorted) {
-      const cat = g.category || "Other";
-      if (!byCat.has(cat)) byCat.set(cat, []);
-      byCat.get(cat).push(g);
-    }
-
-    for (const [cat, items] of byCat.entries()) {
-      lines.push(`${cat}:`);
-      for (const it of items) {
-        lines.push(`- ${it.requirement}: ${it.match_level}`);
-        lines.push(`  Resume evidence: ${it.resume_evidence || "Not found"}`);
-        if (Array.isArray(it.suggestions) && it.suggestions.length) {
-          lines.push("  Suggestions:");
-          for (const s of it.suggestions.slice(0, 3)) lines.push(`  - ${s}`);
-        }
-      }
-      lines.push("");
-    }
-  }
-
-  lines.push("CLOSE MATCHES WORTH NOTING:");
-  if (!closeMatches.length) {
-    lines.push("- (None worth noting based on current filtering.)");
-  } else {
-    const sortedClose = [...closeMatches].sort((a, b) => {
-      const cr = categoryRank(a.category) - categoryRank(b.category);
-      if (cr !== 0) return cr;
-      const mr = matchLevelRank(a.match_level) - matchLevelRank(b.match_level);
-      if (mr !== 0) return mr;
-      return String(a.requirement).localeCompare(String(b.requirement));
-    });
-
-    for (const it of sortedClose) lines.push(`- ${it.requirement} (${it.match_level})`);
+    lines.push("- None clearly matched.");
   }
 
   lines.push("");
-  lines.push("SUMMARY:");
+  lines.push("Missing must-have skills:");
+  if (missingMustHave.length) {
+    for (const item of missingMustHave.slice(0, 5)) lines.push(`- ${item}`);
+  } else {
+    lines.push("- No major must-have gaps found.");
+  }
+
+  lines.push("");
+  lines.push("Missing preferred skills:");
+  if (missingPreferred.length) {
+    for (const item of missingPreferred.slice(0, 5)) lines.push(`- ${item}`);
+  } else {
+    lines.push("- No major preferred gaps found.");
+  }
+
+  lines.push("");
+  lines.push("Summary:");
   lines.push(summaryText);
 
   return wrapReport(lines.join("\n"));
 }
 
-function buildBlockerReport({ blocker, job_title }) {
-  const position = job_title || "Not provided";
-  const company = "Not provided";
+const DEFAULT_SYSTEM_PROMPT =
+  "You are a senior recruiter + ATS expert specialized in OPT/STEM OPT candidate placement. " +
+  "DO NOT output reasoning. Return ONLY JSON that matches the schema. " +
+  "Use ONLY the provided RESUME_ALLOWED_TEXT. " +
+  "Evidence must be an EXACT SUBSTRING from RESUME_ALLOWED_TEXT or null. " +
+  "Do not invent facts, durations, companies, tools, outcomes. " +
+  "Preserve exact JD wording in each requirement string where applicable. " +
+  "Match levels must be one of: Exact | Close | Partial | Missing. " +
+  "Tool rules: variants/extensions => Close; ecosystem tool => Partial; competitors/alternatives => Missing. " +
+  "Industry/regulatory terms require explicit evidence to be anything other than Missing. " +
+  "Keep the output short, structured, and conservative.";
 
-  const body =
-    `🚫 APPLICATION REJECTED - CRITICAL BLOCKER DETECTED
+function buildDefaultUserPrompt({ job_title, job_url, job_text, starred, allowedText }) {
+  return `JOB_TITLE:${job_title}
+JOB_URL:${job_url}
+JD_TEXT:${job_text}
+STARRED_ITEMS:
+${JSON.stringify(starred)}
+RESUME_ALLOWED_TEXT:${allowedText}
 
-Position: ${position}
-Company: ${company}
+TASK:
+0) Extract experience and location requirements if present.
+1) Extract only important JD skills and requirements.
+2) Assign priority:
+   - preferred: if matched to STARRED_ITEMS
+   - must_have: if wording says must/required/minimum/mandatory
+   - unspecified: otherwise
+3) Compare against RESUME_ALLOWED_TEXT using strict matching.
+4) Build:
+   - matched_skills_top5
+   - missing_must_have_skills_top5
+   - missing_preferred_skills_top5
+5) Build requirements_top10 with:
+   { category, requirement, match_level, resume_evidence, suggestions, priority }
+6) Build:
+   - gaps_top6
+   - improvements_top6
+   - summary
 
-BLOCKER IDENTIFIED:
-- ${blocker.blocker_text}
-
-REASON FOR REJECTION:
-This position requires government authorization (clearance/citizenship/permanent residency/export control) which is NOT available to OPT/STEM OPT candidates on F-1 visa status.
-
-OPT/F-1 visa holders CANNOT:
-- Obtain security clearances (any level)
-- Meet U.S. citizenship requirements
-- Work on federal government contracts requiring citizenship
-- Comply with ITAR/export control restrictions
-- Meet "green card required" stipulations
-
-RECOMMENDATION: ⛔ DO NOT APPLY - Skip this position entirely
-
----
-Would you like me to analyze a different job posting?`;
-
-  return body;
+OUTPUT ONLY the required schema keys.`;
 }
 
-export async function matchResumeToJob({ resume_text, job_text, job_url = "", job_title = "" }) {
-  // ✅ STEP 0: Blocker detection (token-free)
-  const blocker = detectOptBlocker(job_text);
-  if (blocker) {
+function buildCustomUserPrompt({
+  userPrompt,
+  job_title,
+  job_url,
+  job_text,
+  starred,
+  allowedText,
+}) {
+  return `USER_CUSTOM_PROMPT:
+${userPrompt}
+
+CONTEXT:
+JOB_TITLE:${job_title}
+JOB_URL:${job_url}
+JD_TEXT:${job_text}
+STARRED_ITEMS:
+${JSON.stringify(starred)}
+RESUME_ALLOWED_TEXT:${allowedText}
+
+IMPORTANT RULES:
+- Use ONLY RESUME_ALLOWED_TEXT for resume evidence.
+- resume_evidence must be an exact substring or null.
+- Do not invent facts.
+- Return ONLY valid JSON matching the schema.`;
+}
+
+export async function matchResumeToJob({
+  resume_text,
+  job_text,
+  job_url = "",
+  job_title = "",
+  custom_prompt = "",
+}) {
+  const blocker = detectHardBlockers(job_text);
+
+  if (blocker.blocked) {
     const report = buildBlockerReport({ blocker, job_title });
+
     return {
       p: 0,
       report,
       json: {
         status: "REJECTED",
+        fit_score: 0,
+        verdict: "BLOCKED",
         blocker_type: blocker.blocker_type,
         blocker_text: blocker.blocker_text,
-        match_score: null,
         eligible_for_opt: false,
-        recommendation: "DO_NOT_APPLY",
-        reason: "Position contains a critical OPT/F-1 blocker (clearance/citizenship/permanent residency/government/export control)."
-      }
+        time_worthiness: "LOW",
+        tailoring_effort: "HIGH",
+        decision_reasons: [
+          "This role has a hard requirement you likely cannot satisfy.",
+          "This application would be low-value.",
+          "Prefer roles without this restriction.",
+        ],
+        requirements: [],
+        matched_skills: [],
+        missing_must_have_skills: [],
+        missing_preferred_skills: [],
+        experience_match: null,
+        location_match: null,
+        report_summary: "Blocked due to hard requirement.",
+        improvements_top5: [],
+      },
     };
   }
 
-  // Resume section restriction (Skills/Summary/Experience only)
   const { allowedText } = extractAllowedResumeText(resume_text);
   const starred = extractStarredItems(job_text);
-
   const model = (process.env.MODEL5 || "gpt-5-mini").trim();
+
+  const userInput =
+    String(custom_prompt || "").trim()
+      ? buildCustomUserPrompt({
+          userPrompt: custom_prompt,
+          job_title,
+          job_url,
+          job_text,
+          starred,
+          allowedText,
+        })
+      : buildDefaultUserPrompt({
+          job_title,
+          job_url,
+          job_text,
+          starred,
+          allowedText,
+        });
 
   const response = await client.responses.create({
     model,
     reasoning: { effort: "low" },
     input: [
-      // OLD SYSTEM PROMPT
-      // {
-      //   role: "system",
-      //   content:
-      //     "You are a senior recruiter + ATS expert specialized in OPT/STEM OPT candidate placement. " +
-      //     "DO NOT output reasoning. Return ONLY JSON that matches the schema. " +
-      //     "Use ONLY the provided RESUME_ALLOWED_TEXT (Skills/Summary/Experience). Ignore projects/certifications even if present elsewhere. " +
-      //     "Evidence must be an EXACT SUBSTRING from RESUME_ALLOWED_TEXT or null. " +
-      //     "Do not invent facts, durations, companies, tools, outcomes. " +
-      //     "Preserve exact JD wording in each requirement string (copy exact phrases). " +
-      //     "Match levels must be one of: Exact | Close | Partial | Missing. " +
-      //     "Tool rules: variants/extensions => Close; ecosystem tool => Partial; competitors/alternatives => Missing (AWS≠Azure/GCP, React≠Angular/Vue, MongoDB≠PostgreSQL, etc). " +
-      //     "Industry/regulatory terms require explicit evidence (substring) to be anything other than Missing. " +
-      //     "Max 3 suggestions per gap; keep them conservative and role-credible. " +
-      //     "Return SHORT output only (top skills + max 10 requirement items)."
-      // },
-      // NEW SYSTEM PROMPT
       {
         role: "system",
-        content:
-          "You are a senior recruiter + ATS expert specialized in OPT/STEM OPT candidate placement. " +
-          "DO NOT output reasoning. Return ONLY JSON that matches the schema. " +
-          "Use ONLY the provided RESUME_ALLOWED_TEXT (Skills/Summary/Experience). Ignore projects/certifications even if present elsewhere. " +
-          "Evidence must be an EXACT SUBSTRING from RESUME_ALLOWED_TEXT or null. " +
-          "Do not invent facts, durations, companies, tools, outcomes. " +
-          "Preserve exact JD wording in each requirement string (copy exact phrases). " +
-          "Match levels must be one of: Exact | Close | Partial | Missing. " +
-          "Tool rules: variants/extensions => Close; ecosystem tool => Partial; competitors/alternatives => Missing (AWS≠Azure/GCP, React≠Angular/Vue, MongoDB≠PostgreSQL, etc). " +
-          "Industry/regulatory terms require explicit evidence (substring) to be anything other than Missing. " +
-          "Max 3 suggestions per requirement; keep them conservative and role-credible. " +
-          "For Exact matches, suggestions must be an empty array []. " +
-          "Return SHORT output only (top skills + max 10 requirement items). " +
-          "Also extract years-of-experience and location requirement if present, then compare with resume (strict). " +
-          "Output must contain ONLY these top-level keys: matched_skills_top5, missing_must_have_skills_top5, missing_preferred_skills_top5, experience_required, experience_candidate, experience_match, location_required, location_candidate, location_match, gaps_top6, improvements_top5, requirements_top10, summary."
-
+        content: DEFAULT_SYSTEM_PROMPT,
       },
-      // UserPrompt with FullAnalyise
-      // {
-      //   role: "user",
-      //   content:
-      //     `JOB_TITLE:\n${job_title}\n\n` +
-      //     `JOB_URL:\n${job_url}\n\n` +
-      //     `JD_TEXT:\n${job_text}\n\n` +
-      //     `STARRED_ITEMS (preferred key skills marked with "*"):\n${JSON.stringify(starred)}\n\n` +
-      //     `RESUME_ALLOWED_TEXT:\n${allowedText}\n\n` +
-      //     "TASK:\n" +
-      //     "1) Extract JD requirements across ONLY these categories: Skills; Tools & Technologies; Relevant Experiences; Domain/Industry Knowledge; Regulatory/Compliance Requirements; Years of Experience; Measurable Outcomes / Impact.\n" +
-      //     "2) Normalize/cluster ONLY conceptual synonyms (example: client management ≈ customer success). Keep named tools/platforms and regulatory terms UNCLUSTERED and exact.\n" +
-      //     "3) For EACH extracted requirement, output:\n" +
-      //     "   - category\n" +
-      //     "   - requirement (MUST preserve exact JD wording)\n" +
-      //     "   - match_level (Exact | Close | Partial | Missing)\n" +
-      //     "   - resume_evidence (MUST be an exact substring from RESUME_ALLOWED_TEXT or null)\n" +
-      //     "   - suggestions (ONLY if match_level is Missing/Partial/Close; max 3; conservative; do not invent facts/tools/durations)\n" +
-      //     "   - priority (must_have | preferred | unspecified)\n" +
-      //     "4) PRIORITY RULES:\n" +
-      //     "   - If the requirement text matches any STARRED_ITEMS entry (case-insensitive), set priority='preferred'.\n" +
-      //     "   - If JD wording indicates required (e.g., 'must', 'required', 'minimum', 'need to'), set priority='must_have'.\n" +
-      //     "   - Otherwise set priority='unspecified'.\n" +
-      //     "5) Provide a 2–3 sentence summary of overall fit and key actions to improve alignment.\n"
-      // }
-
       {
         role: "user",
-        content: `JOB_TITLE:${job_title}
-        JOB_URL:${job_url}
-        JD_TEXT:${job_text}
-        STARRED_ITEMS (preferred key skills marked with "*"):
-        ${JSON.stringify(starred)}
-        RESUME_ALLOWED_TEXT:${allowedText}
-
-      TASK (TOKEN-LIGHT, GAP-FIRST OUTPUT):
-      0) Experience & Location extraction:
-         - If JD mentions years (e.g. "2+ years", "3-5 years"), set experience_required EXACT JD text.
-         - From RESUME_ALLOWED_TEXT, extract candidate years/duration if present (short). If not found, empty string.
-         - Set experience_match true only if candidate clearly meets/exceeds required; else false.
-         - Extract JD location requirement (Remote/Hybrid/Onsite + city/state if present) into location_required.
-         - Extract candidate location from RESUME_ALLOWED_TEXT if present; else empty string.
-         - Set location_match true only if clearly compatible; else false.
-
-      1) Extract ONLY JD SKILLS (named tools + skills) that are important for the role. Keep wording EXACT from the JD for each extracted skill/requirement.
-
-      2) Assign priority for each JD skill:
-         - preferred: if the skill text matches any STARRED_ITEMS entry (case-insensitive)
-         - must_have: if the JD wording indicates required (must, required, minimum, need, mandatory)
-         - unspecified: otherwise
-
-      3) Compare each JD skill against RESUME_ALLOWED_TEXT using strict matching:
-         match_level = Exact | Close | Partial | Missing
-         resume_evidence MUST be an exact substring from RESUME_ALLOWED_TEXT or null.
-
-      4) Build lists (dedupe, most important first):
-         - matched_skills_top5: top 5 JD skills with match_level in (Exact/Close/Partial)
-         - missing_must_have_skills_top5: top 5 Missing skills with priority = must_have
-         - missing_preferred_skills_top5: top 5 Missing skills with priority = preferred
-
-      5) Build requirements_top10 (MAX 10 items) with:
-         { category, requirement, match_level, resume_evidence, suggestions, priority }
-         CATEGORY RULES:
-         - Use category = "Tools & Technologies" when it is a named tool/platform/language/framework
-         - Else category = "Skills"
-         REQUIREMENTS_TOP10 MUST be GAP-FIRST in this order:
-         A) Missing + must_have first
-         B) Missing + preferred next
-         C) Missing + unspecified next
-         D) Then Close/Partial must_have/preferred if space remains
-         Each item MUST include suggestions ONLY when match_level is Missing/Close/Partial (max 3).
-
-      6) Create:
-         - gaps_top6: top 6 high-impact missing items (prefer Tools & Technologies first, then Skills)
-         - improvements_top6: top 6 short actionable suggestions (<= 10 words each), deduped
-         - summary: 2–3 sentences max
-
-      OUTPUT ONLY these keys and nothing else:
-      matched_skills_top5
-      missing_must_have_skills_top5
-      missing_preferred_skills_top5
-      experience_required
-      experience_candidate
-      experience_match
-      location_required
-      location_candidate
-      location_match
-      gaps_top6
-      improvements_top6
-      requirements_top10
-      summary`
-      }
+        content: userInput,
+      },
     ],
     text: {
       format: {
         type: "json_schema",
-        name: "opt_match_light_v2",
+        name: "resume_match_decision_v3",
         schema: {
           type: "object",
           additionalProperties: false,
           properties: {
-            matched_skills_top5: { type: "array", items: { type: "string" }, maxItems: 5 },
-            missing_must_have_skills_top5: { type: "array", items: { type: "string" }, maxItems: 5 },
-            missing_preferred_skills_top5: { type: "array", items: { type: "string" }, maxItems: 5 },
+            matched_skills_top5: {
+              type: "array",
+              items: { type: "string" },
+              maxItems: 5,
+            },
+            missing_must_have_skills_top5: {
+              type: "array",
+              items: { type: "string" },
+              maxItems: 5,
+            },
+            missing_preferred_skills_top5: {
+              type: "array",
+              items: { type: "string" },
+              maxItems: 5,
+            },
 
-            experience_required: { type: "string" },     // e.g. "3+ years"
-            experience_candidate: { type: "string" },    // short text, can be ""
-            experience_match: { type: "boolean" },
+            experience_required: { type: "string" },
+            experience_candidate: { type: "string" },
+            experience_match: { type: ["boolean", "null"] },
 
-            location_required: { type: "string" },       // e.g. "Bengaluru / Hybrid"
-            location_candidate: { type: "string" },      // short text, can be ""
-            location_match: { type: "boolean" },
+            location_required: { type: "string" },
+            location_candidate: { type: "string" },
+            location_match: { type: ["boolean", "null"] },
 
             gaps_top6: {
               type: "array",
@@ -438,14 +455,14 @@ export async function matchResumeToJob({ resume_text, job_text, job_url = "", jo
               maxItems: 6,
               items: {
                 type: "object",
+                additionalProperties: false,
                 properties: {
                   gap: { type: "string" },
                   why_it_matters: { type: "string" },
-                  quick_fix: { type: "string" }
+                  quick_fix: { type: "string" },
                 },
                 required: ["gap", "why_it_matters", "quick_fix"],
-                additionalProperties: false
-              }
+              },
             },
 
             improvements_top6: {
@@ -454,13 +471,13 @@ export async function matchResumeToJob({ resume_text, job_text, job_url = "", jo
               maxItems: 6,
               items: {
                 type: "object",
+                additionalProperties: false,
                 properties: {
                   improvement: { type: "string" },
-                  example_bullet: { type: "string" }
+                  example_bullet: { type: "string" },
                 },
                 required: ["improvement", "example_bullet"],
-                additionalProperties: false
-              }
+              },
             },
 
             requirements_top10: {
@@ -472,16 +489,33 @@ export async function matchResumeToJob({ resume_text, job_text, job_url = "", jo
                 properties: {
                   category: { type: "string" },
                   requirement: { type: "string" },
-                  match_level: { type: "string", enum: ["Exact", "Close", "Partial", "Missing"] },
+                  match_level: {
+                    type: "string",
+                    enum: ["Exact", "Close", "Partial", "Missing"],
+                  },
                   resume_evidence: { type: ["string", "null"] },
-                  suggestions: { type: "array", items: { type: "string" }, maxItems: 3 },
-                  priority: { type: "string", enum: ["must_have", "preferred", "unspecified"] }
+                  suggestions: {
+                    type: "array",
+                    items: { type: "string" },
+                    maxItems: 3,
+                  },
+                  priority: {
+                    type: "string",
+                    enum: ["must_have", "preferred", "unspecified"],
+                  },
                 },
-                required: ["category", "requirement", "match_level", "resume_evidence", "suggestions", "priority"]
-              }
+                required: [
+                  "category",
+                  "requirement",
+                  "match_level",
+                  "resume_evidence",
+                  "suggestions",
+                  "priority",
+                ],
+              },
             },
 
-            summary: { type: "string" }
+            summary: { type: "string" },
           },
           required: [
             "matched_skills_top5",
@@ -496,26 +530,23 @@ export async function matchResumeToJob({ resume_text, job_text, job_url = "", jo
             "gaps_top6",
             "improvements_top6",
             "requirements_top10",
-            "summary"
-          ]
-        }
-      }
-    }
+            "summary",
+          ],
+        },
+      },
+    },
   });
 
   const raw = JSON.parse(response.output_text);
-
-  // Post-validate evidence is an exact substring (hard guardrail)
   const allowed = String(allowedText || "");
+
   const requirements = (raw.requirements_top10 || []).map((r) => {
     let evidence = r.resume_evidence;
     let level = r.match_level;
 
-    if (typeof evidence === "string") {
-      if (!allowed.includes(evidence)) {
-        evidence = null;
-        level = "Missing";
-      }
+    if (typeof evidence === "string" && !allowed.includes(evidence)) {
+      evidence = null;
+      level = "Missing";
     }
 
     if ((level === "Exact" || level === "Close" || level === "Partial") && !evidence) {
@@ -528,77 +559,98 @@ export async function matchResumeToJob({ resume_text, job_text, job_url = "", jo
       match_level: level,
       resume_evidence: evidence,
       suggestions: Array.isArray(r.suggestions) ? r.suggestions.slice(0, 3) : [],
-      priority: r.priority || "unspecified"
+      priority: r.priority || "unspecified",
     };
   });
 
-  const matchScore = computeMatchScore(requirements);
-  const skillsScore = computeSkillsEligibility(requirements);
-  const eligibilityPct = skillsScore.eligibility_pct;
-  const rec = recommendationFromScore(matchScore);
-  const overallMatchScore = computeMatchScore(requirements);
-
-  // Minimum report threshold:
-  const gaps = requirements.filter((r) => {
-    if (!isHighImpactCategory(r.category)) return false;
-    if (r.match_level === "Missing") return true;
-    return isKeyCloseOrPartial(r);
-  });
-
-  const closeMatches = requirements.filter((r) => isKeyCloseOrPartial(r));
-
-  const summaryText =
-    String(raw.summary || "").trim() ||
-    "Overall fit looks workable; tighten keyword alignment and ensure every claimed match has explicit resume evidence.";
-
-  const report = buildReport({
-    matchScore,
-    gaps,
-    closeMatches,
-    summaryText
-  });
-
-  // ✅ Ensure these are max 5 and deduped
   const matched_skills_top5 = uniq(raw.matched_skills_top5).slice(0, 5);
   const missing_must_have_skills_top5 = uniq(raw.missing_must_have_skills_top5).slice(0, 5);
   const missing_preferred_skills_top5 = uniq(raw.missing_preferred_skills_top5).slice(0, 5);
 
-  // ✅ NEW: Experience/Location + Top6 blocks (safe defaults)
   const experience_required = String(raw.experience_required || "").trim();
   const experience_candidate = String(raw.experience_candidate || "").trim();
-  const experience_match = !!raw.experience_match;
+  const experience_match =
+    typeof raw.experience_match === "boolean" ? raw.experience_match : null;
 
   const location_required = String(raw.location_required || "").trim();
   const location_candidate = String(raw.location_candidate || "").trim();
-  const location_match = !!raw.location_match;
+  const location_match =
+    typeof raw.location_match === "boolean" ? raw.location_match : null;
 
   const gaps_top6 = Array.isArray(raw.gaps_top6) ? raw.gaps_top6.slice(0, 6) : [];
-  const improvements_top6 = Array.isArray(raw.improvements_top6) ? raw.improvements_top6.slice(0, 6) : [];
+  const improvements_top6 = Array.isArray(raw.improvements_top6)
+    ? raw.improvements_top6.slice(0, 6)
+    : [];
 
-  // ✅ Backward compatible keys (so frontend won't break)
-  const matched_skills = matched_skills_top5;
-  const missing_must_have_skills = missing_must_have_skills_top5;
-  const missing_preferred_skills = missing_preferred_skills_top5;
+  const matchScore = computeMatchScore(requirements);
+  const skillsScore = computeSkillsEligibility(requirements);
+
+  const normalized = {
+    requirements,
+    matched_skills: matched_skills_top5,
+    missing_must_have_skills: missing_must_have_skills_top5,
+    missing_preferred_skills: missing_preferred_skills_top5,
+    experience_match,
+    location_match,
+    report_summary:
+      String(raw.summary || "").trim() ||
+      "Overall fit looks workable; tighten keyword alignment and make strong evidence more explicit.",
+    improvements_top5: improvements_top6.slice(0, 5),
+  };
+
+  const decision = computeVerdict({
+    blocked: false,
+    rawScore: skillsScore.eligibility_pct || matchScore,
+    missingMustHaveCount: normalized.missing_must_have_skills.length,
+    missingPreferredCount: normalized.missing_preferred_skills.length,
+    experienceMatch: normalized.experience_match,
+    locationMatch: normalized.location_match,
+  });
+
+  const decision_reasons = buildDecisionReasons({
+    matchedSkills: normalized.matched_skills,
+    missingMustHaveSkills: normalized.missing_must_have_skills,
+    missingPreferredSkills: normalized.missing_preferred_skills,
+    experienceMatch: normalized.experience_match,
+    locationMatch: normalized.location_match,
+  });
+
+  const report = buildReport({
+    fitScore: decision.fit_score,
+    verdict: decision.verdict,
+    matchedSkills: normalized.matched_skills,
+    missingMustHave: normalized.missing_must_have_skills,
+    missingPreferred: normalized.missing_preferred_skills,
+    summaryText: normalized.report_summary,
+  });
 
   return {
-    p: clamp(Math.round(eligibilityPct), 0, 100),
+    p: decision.fit_score,
     report,
     json: {
       status: "ELIGIBLE",
       blocker_type: null,
       blocker_text: null,
       eligible_for_opt: true,
-      match_score: matchScore,     // old overall score (same rahe)
-      overall_match_score: overallMatchScore, // old average (keep for reference)
-      skills_score: skillsScore,   // NEW: eligibility breakdown
-      recommendation: rec,
 
-      // ✅ NEW (top5)
+      fit_score: decision.fit_score,
+      verdict: decision.verdict,
+      decision_reasons,
+      time_worthiness: decision.time_worthiness,
+      tailoring_effort: decision.tailoring_effort,
+
+      match_score: matchScore,
+      overall_match_score: matchScore,
+      skills_score: skillsScore,
+
       matched_skills_top5,
       missing_must_have_skills_top5,
       missing_preferred_skills_top5,
 
-      // ✅ Experience + Location match
+      matched_skills: normalized.matched_skills,
+      missing_must_have_skills: normalized.missing_must_have_skills,
+      missing_preferred_skills: normalized.missing_preferred_skills,
+
       experience_required,
       experience_candidate,
       experience_match,
@@ -607,18 +659,15 @@ export async function matchResumeToJob({ resume_text, job_text, job_url = "", jo
       location_candidate,
       location_match,
 
-      // ✅ Top6 token-light lists
       gaps_top6,
       improvements_top6,
+      improvements_top5: normalized.improvements_top5,
 
-      // ✅ OLD (compat)
-      matched_skills,
-      missing_must_have_skills,
-      missing_preferred_skills,
+      requirements_top10: normalized.requirements,
+      requirements: normalized.requirements,
 
-      // ✅ small list only
-      requirements_top10: requirements,
-      summary: summaryText
-    }
+      report_summary: normalized.report_summary,
+      summary: normalized.report_summary,
+    },
   };
 }
